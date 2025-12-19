@@ -1,0 +1,30 @@
+[exporter]
+mode = "mux"
+enabled = true
+host = "0.0.0.0"
+port = 9464
+path = "/metrics"
+namespace = "oms"
+
+[labels]
+service = "oms"
+component = "test_promkit_trader_B"
+env = "dev"
+version = "0.1.0"
+instance = "local"
+
+[buckets]
+latency_short = [0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2]
+
+[[metrics]]
+name = "orders_received_total"
+type = "counter"
+help = "Total number of received orders"
+unit = "events"
+
+[[metrics]]
+name = "order_processing_seconds"
+type = "histogram"
+help = "Time spent processing an order"
+unit = "seconds"
+buckets_profile = "latency_short"

@@ -32,6 +32,10 @@ bool Init(const Config& cfg) noexcept;
 bool InitFromToml(const std::string& toml_path) noexcept;
 void Shutdown() noexcept;
 
+// Returns whether the backend is currently running (thread-safe).
+// Useful for guarding calls in apps that may ShutDown while worker threads are still draining.
+bool IsRunning() noexcept;
+
 // Counters
 CounterId CreateCounter(const std::string& name,
                         const std::string& help,

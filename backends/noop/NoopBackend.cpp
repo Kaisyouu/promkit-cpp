@@ -4,7 +4,9 @@
 namespace promkit {
 
 bool Init(const Config&) noexcept { return true; }
+bool InitFromToml(const std::string&) noexcept { return true; }
 void Shutdown() noexcept {}
+bool IsRunning() noexcept { return false; }
 
 CounterId CreateCounter(const std::string&, const std::string&, const std::map<std::string, std::string>&) noexcept {
   return 0; // invalid id

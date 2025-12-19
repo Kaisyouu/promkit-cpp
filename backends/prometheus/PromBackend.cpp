@@ -10,13 +10,18 @@
 #include <prometheus/counter.h>
 #include <prometheus/gauge.h>
 #include <prometheus/histogram.h>
+#include "mux/MuxCollector.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
+#include <unistd.h>
 #include <vector>
 
 namespace promkit {
@@ -54,6 +59,16 @@ struct Backend {
 
   // Global config
   Config cfg;
+  // Lifecycle state for safety around Shutdown/Reinit
+  enum class State { Uninitialized, Running, ShuttingDown, Stopped };
+  std::atomic<State> state{State::Uninitialized};
+
+  // mux mode helpers
+  bool mux_mode = false;         // cfg.mode == "mux"
+  bool mux_aggregator = false;   // true if we own the public port
+  std::string mux_dir;           // directory for worker descriptors
+  std::string mux_worker_file;   // path to my descriptor file when worker
+  std::shared_ptr<promkit::mux::MuxCollector> mux_collectable; // keep alive
 };
 
 Backend& G() {
@@ -88,6 +103,52 @@ static std::string LabelsKey(const std::map<std::string, std::string>& labels) {
 
 static std::vector<double> DefaultLatencyBuckets() {
   return {0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2};
+}
+
+// Clear all local caches/families/specs under lock. Does not touch registry/exposer.
+static void ClearCachesLocked() {
+  G().counters.clear();
+  G().gauges.clear();
+  G().histograms.clear();
+  G().counter_series.clear();
+  G().gauge_series.clear();
+  G().hist_series.clear();
+  G().specs.clear();
+  G().has_fcfg = false;
+}
+
+// Helper: build mux worker directory path: /tmp/promkit-mux/<ns>
+static std::string BuildMuxDir(const Config& cfg) {
+  std::string ns = cfg.prefix; // may be empty
+  if (ns.empty()) ns = "default";
+  return std::string{"/tmp/promkit-mux/"} + ns;
+}
+
+static bool EnsureDir(const std::string& dir) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  if (fs::exists(dir, ec)) return true;
+  return fs::create_directories(dir, ec);
+}
+
+static std::string MuxComponentName(const Config& cfg) {
+  if (auto it = cfg.labels.find("component"); it != cfg.labels.end() && !it->second.empty()) return it->second;
+  return std::string{"component-"} + std::to_string(::getpid());
+}
+
+static std::string WriteWorkerDescriptor(const Config& cfg, const std::string& dir, int port) {
+  if (!EnsureDir(dir)) return {};
+  const int pid = ::getpid();
+  std::string file = dir + "/port." + std::to_string(pid);
+  std::ofstream ofs(file, std::ios::trunc);
+  if (!ofs) return {};
+  ofs << "endpoint 127.0.0.1:" << port << "\n";
+  ofs << "component " << MuxComponentName(cfg) << "\n";
+  // pid 写入仅用于调试；后续聚合不再使用 pid 作为标签
+  ofs << "pid " << pid << "\n";
+  ofs << "path " << (cfg.path.empty() ? "/metrics" : cfg.path) << "\n";
+  ofs.close();
+  return file;
 }
 
 static prometheus::Family<prometheus::Counter>& GetOrMakeCounterFam(const std::string& fname, const std::string& help) {
@@ -213,19 +274,73 @@ static void PreRegisterFromFileConfig() {
 
 bool Init(const Config& cfg) noexcept {
   try {
+    // If already running, perform a safe shutdown to allow re-init.
+    auto prev = G().state.load(std::memory_order_acquire);
+    if (prev == Backend::State::Running) {
+      // Best-effort shutdown
+      Shutdown();
+    }
+
     G().cfg = cfg;
-    if (!cfg.enabled) return true; // disabled: still succeed
+    G().mux_mode = (cfg.mode == "mux");
+    if (!cfg.enabled) {
+      G().state.store(Backend::State::Stopped, std::memory_order_release);
+      return true; // disabled: still succeed
+    }
 
     G().registry = std::make_shared<prometheus::Registry>();
 
-    // Build exposer address
-    std::string addr = cfg.host + ":" + std::to_string(cfg.port);
-    G().exposer = std::make_unique<prometheus::Exposer>(addr);
-    // Register /metrics endpoint (respect configured path)
-    G().exposer->RegisterCollectable(G().registry, cfg.path.empty() ? std::string{"/metrics"} : cfg.path);
+    // mux mode: try aggregator first
+    if (G().mux_mode) {
+      try {
+        // Try binding public port as aggregator
+        std::string addr = cfg.host + ":" + std::to_string(cfg.port);
+        G().exposer = std::make_unique<prometheus::Exposer>(addr);
+        G().exposer->RegisterCollectable(G().registry, cfg.path.empty() ? std::string{"/metrics"} : cfg.path);
+        // Register mux collector to same path
+        G().mux_dir = BuildMuxDir(cfg);
+        EnsureDir(G().mux_dir);
+        G().mux_collectable = std::make_shared<promkit::mux::MuxCollector>();
+        G().mux_collectable->SetDirectory(G().mux_dir);
+        // 让聚合器自身也以 component 身份加入合并
+        G().mux_collectable->SetSelf(G().registry, MuxComponentName(cfg));
+        G().exposer->RegisterCollectable(G().mux_collectable, cfg.path.empty() ? std::string{"/metrics"} : cfg.path);
+        G().mux_aggregator = true;
+      } catch (...) {
+        // Aggregator failed; become worker
+        G().exposer.reset();
+        std::string addr_local = std::string{"127.0.0.1:"} + std::to_string(0);
+        G().exposer = std::make_unique<prometheus::Exposer>(addr_local);
+        G().exposer->RegisterCollectable(G().registry, cfg.path.empty() ? std::string{"/metrics"} : cfg.path);
+        auto ports = G().exposer->GetListeningPorts();
+        int port = ports.empty() ? 0 : ports.front();
+        if (port <= 0) throw std::runtime_error("failed to bind ephemeral port for worker");
+        G().mux_dir = BuildMuxDir(cfg);
+        G().mux_worker_file = WriteWorkerDescriptor(cfg, G().mux_dir, port);
+        if (G().mux_worker_file.empty()) throw std::runtime_error("failed to write worker descriptor");
+        G().mux_aggregator = false;
+        G().state.store(Backend::State::Running, std::memory_order_release);
+        return true;
+      }
 
+      // Aggregator success: register mux collector
+      try {
+        // Defer include to avoid header dependency error
+        // We include header here
+      } catch (...) {}
+    }
+
+    // single mode or mux aggregator fallback path: normal exposer
+    if (!G().exposer) {
+      std::string addr = cfg.host + ":" + std::to_string(cfg.port);
+      G().exposer = std::make_unique<prometheus::Exposer>(addr);
+      G().exposer->RegisterCollectable(G().registry, cfg.path.empty() ? std::string{"/metrics"} : cfg.path);
+    }
+
+    G().state.store(Backend::State::Running, std::memory_order_release);
     return true;
   } catch (...) {
+    G().state.store(Backend::State::Stopped, std::memory_order_release);
     return false;
   }
 }
@@ -251,7 +366,9 @@ bool InitFromToml(const std::string& toml_path) noexcept {
     // Save config and pre-register time series based on definitions
     G().fcfg = std::move(fcfg);
     G().has_fcfg = true;
-    PreRegisterFromFileConfig();
+    if (G().state.load(std::memory_order_acquire) == Backend::State::Running) {
+      PreRegisterFromFileConfig();
+    }
     return true;
   } catch (...) {
     return false;
@@ -260,20 +377,51 @@ bool InitFromToml(const std::string& toml_path) noexcept {
 
 void Shutdown() noexcept {
   try {
+    // Transition to shutting down to gate all API calls.
+    G().state.store(Backend::State::ShuttingDown, std::memory_order_release);
+    G().cfg.enabled = false; // extra guard for older checks
+
+    // Clear caches under lock so concurrent creators won't deref stale pointers.
+    {
+      std::lock_guard<std::mutex> lk(G().mu);
+      ClearCachesLocked();
+    }
+
+    // Remove worker descriptor if any
+    try {
+      if (!G().mux_worker_file.empty()) {
+        std::error_code ec; std::filesystem::remove(G().mux_worker_file, ec);
+        G().mux_worker_file.clear();
+      }
+    } catch (...) {}
+
+    // Tear down prometheus-cpp objects after caches are cleared.
     G().exposer.reset();
     G().registry.reset();
+
+    G().state.store(Backend::State::Stopped, std::memory_order_release);
   } catch (...) {
+    G().state.store(Backend::State::Stopped, std::memory_order_release);
+  }
+}
+
+bool IsRunning() noexcept {
+  try {
+    return G().cfg.enabled && G().state.load(std::memory_order_acquire) == Backend::State::Running;
+  } catch (...) {
+    return false;
   }
 }
 
 CounterId CreateCounter(const std::string& name, const std::string& help,
                         const std::map<std::string, std::string>& const_labels) noexcept {
-  if (!G().cfg.enabled) return 0;
+  if (!G().cfg.enabled || G().state.load(std::memory_order_acquire) != Backend::State::Running) return 0;
   try {
     const auto fname = FullName(G().cfg.prefix, name);
     std::map<std::string, std::string> final_labels = MergeLabels(G().cfg.labels, const_labels);
 
     std::lock_guard<std::mutex> lk(G().mu);
+    if (G().state.load(std::memory_order_relaxed) != Backend::State::Running) return 0;
     // If spec exists, enforce allowed labels and inject spec.const_labels
     auto sit = G().specs.find(fname);
     if (sit != G().specs.end()) {
@@ -296,18 +444,19 @@ CounterId CreateCounter(const std::string& name, const std::string& help,
 }
 
 void CounterAdd(CounterId id, double value) noexcept {
-  if (!G().cfg.enabled || id == 0) return;
+  if (!G().cfg.enabled || id == 0 || G().state.load(std::memory_order_acquire) != Backend::State::Running) return;
   auto* c = reinterpret_cast<prometheus::Counter*>(id);
   if (value > 0) c->Increment(value);
 }
 
 GaugeId CreateGauge(const std::string& name, const std::string& help,
                     const std::map<std::string, std::string>& const_labels) noexcept {
-  if (!G().cfg.enabled) return 0;
+  if (!G().cfg.enabled || G().state.load(std::memory_order_acquire) != Backend::State::Running) return 0;
   try {
     const auto fname = FullName(G().cfg.prefix, name);
     std::map<std::string, std::string> final_labels = MergeLabels(G().cfg.labels, const_labels);
     std::lock_guard<std::mutex> lk(G().mu);
+    if (G().state.load(std::memory_order_relaxed) != Backend::State::Running) return 0;
     auto sit = G().specs.find(fname);
     if (sit != G().specs.end()) {
       for (const auto& kv : sit->second.const_labels) final_labels.emplace(kv.first, kv.second);
@@ -327,13 +476,13 @@ GaugeId CreateGauge(const std::string& name, const std::string& help,
 }
 
 void GaugeSet(GaugeId id, double value) noexcept {
-  if (!G().cfg.enabled || id == 0) return;
+  if (!G().cfg.enabled || id == 0 || G().state.load(std::memory_order_acquire) != Backend::State::Running) return;
   auto* g = reinterpret_cast<prometheus::Gauge*>(id);
   g->Set(value);
 }
 
 void GaugeAdd(GaugeId id, double delta) noexcept {
-  if (!G().cfg.enabled || id == 0) return;
+  if (!G().cfg.enabled || id == 0 || G().state.load(std::memory_order_acquire) != Backend::State::Running) return;
   auto* g = reinterpret_cast<prometheus::Gauge*>(id);
   if (delta >= 0) g->Increment(delta); else g->Decrement(-delta);
 }
@@ -341,11 +490,12 @@ void GaugeAdd(GaugeId id, double delta) noexcept {
 HistogramId CreateHistogram(const std::string& name, const std::string& help,
                             const std::vector<double>& buckets,
                             const std::map<std::string, std::string>& const_labels) noexcept {
-  if (!G().cfg.enabled) return 0;
+  if (!G().cfg.enabled || G().state.load(std::memory_order_acquire) != Backend::State::Running) return 0;
   try {
     const auto fname = FullName(G().cfg.prefix, name);
     std::map<std::string, std::string> final_labels = MergeLabels(G().cfg.labels, const_labels);
     std::lock_guard<std::mutex> lk(G().mu);
+    if (G().state.load(std::memory_order_relaxed) != Backend::State::Running) return 0;
     auto sit = G().specs.find(fname);
     if (sit != G().specs.end()) {
       for (const auto& kv : sit->second.const_labels) final_labels.emplace(kv.first, kv.second);
@@ -366,7 +516,7 @@ HistogramId CreateHistogram(const std::string& name, const std::string& help,
 }
 
 void HistogramObserve(HistogramId id, double value) noexcept {
-  if (!G().cfg.enabled || id == 0) return;
+  if (!G().cfg.enabled || id == 0 || G().state.load(std::memory_order_acquire) != Backend::State::Running) return;
   auto* h = reinterpret_cast<prometheus::Histogram*>(id);
   h->Observe(value);
 }
@@ -379,6 +529,7 @@ namespace promkit {
 bool Init(const Config&) noexcept { return true; }
 bool InitFromToml(const std::string&) noexcept { return true; }
 void Shutdown() noexcept {}
+bool IsRunning() noexcept { return false; }
 CounterId CreateCounter(const std::string&, const std::string&, const std::map<std::string, std::string>&) noexcept { return 0; }
 void CounterAdd(CounterId, double) noexcept {}
 GaugeId CreateGauge(const std::string&, const std::string&, const std::map<std::string, std::string>&) noexcept { return 0; }

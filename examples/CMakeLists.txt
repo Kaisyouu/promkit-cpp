@@ -3,3 +3,7 @@ target_link_libraries(example_single_minimal PRIVATE promkit)
 
 add_executable(example_single_from_toml single_from_toml.cpp)
 target_link_libraries(example_single_from_toml PRIVATE promkit)
+
+# OMS trader example
+add_executable(example_oms_trader oms_trader_example.cpp)
+target_link_libraries(example_oms_trader PRIVATE promkit)
