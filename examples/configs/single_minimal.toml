@@ -1,0 +1,34 @@
+[exporter]
+mode = "single"
+enabled = true
+host = "127.0.0.1"
+port = 9464
+path = "/metrics"
+namespace = "promkit"
+
+[labels]
+service = "example"
+component = "demo"
+env = "dev"
+version = "0.1.0"
+instance = "local"
+
+[buckets]
+latency_short = [0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2]
+
+[[metrics]]
+name = "orders_processed_total"
+type = "counter"
+help = "Total orders processed"
+unit = "events"
+dynamic_labels = { result = ["ok", "error"] }
+publish = "both"
+
+[[metrics]]
+name = "order_processing_seconds"
+type = "histogram"
+help = "Order processing latency"
+unit = "seconds"
+buckets_profile = "latency_short"
+dynamic_labels = { stage = ["parse", "validate", "write", "respond"] }
+publish = "both"
