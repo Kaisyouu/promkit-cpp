@@ -14,10 +14,38 @@
 #include <algorithm>
 #include <unordered_map>
 
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <signal.h>
+#ifdef _WIN32
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  include <windows.h>
+#else
+#  include <sys/socket.h>
+#  include <arpa/inet.h>
+#  include <unistd.h>
+#  include <signal.h>
+#endif
+
+namespace {
+#ifdef _WIN32
+struct WsaInit { WsaInit(){ WSADATA d; WSAStartup(MAKEWORD(2,2), &d);} ~WsaInit(){ WSACleanup(); } };
+static WsaInit g_wsa_init; // ensure WSA is initialized once
+using socket_t = SOCKET;
+constexpr socket_t invalid_socket = INVALID_SOCKET;
+inline void closesock(socket_t s){ if(s!=INVALID_SOCKET) ::closesocket(s); }
+static bool PidAlive(int pid) {
+  HANDLE h = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+  if (!h) return false;
+  DWORD code = 0; BOOL ok = ::GetExitCodeProcess(h, &code);
+  ::CloseHandle(h);
+  return ok && code == STILL_ACTIVE;
+}
+#else
+using socket_t = int;
+constexpr socket_t invalid_socket = -1;
+inline void closesock(socket_t s){ if(s>=0) ::close(s); }
+static bool PidAlive(int pid) { return ::kill(pid, 0) == 0; }
+#endif
+} // anonymous
 
 namespace fs = std::filesystem;
 
@@ -57,7 +85,7 @@ static std::vector<WorkerEndpoint> ScanDir(const std::string& dir) {
     }
     // Prune stale descriptor: pid not alive
     if (we.pid > 0) {
-      if (::kill(we.pid, 0) != 0) {
+      if (!PidAlive(we.pid)) {
         std::error_code ec2; fs::remove(de.path(), ec2);
         continue;
       }
@@ -74,18 +102,18 @@ static std::string HttpGetLocal(const WorkerEndpoint& we) {
   // Note: this is intentionally simple and localhost-only.
   std::ostringstream out;
   try {
-    int sock = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return {};
+    socket_t sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == invalid_socket) return {};
     sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons(we.port);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1
-    if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) { ::close(sock); return {}; }
+    if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) { closesock(sock); return {}; }
     std::string req = "GET " + we.path + " HTTP/1.0\r\nHost: " + we.host + "\r\nConnection: close\r\n\r\n";
-    ::send(sock, req.data(), req.size(), 0);
+    ::send(sock, req.data(), (int)req.size(), 0);
     char buf[4096];
     std::string resp;
-    ssize_t n;
-    while ((n = ::recv(sock, buf, sizeof(buf), 0)) > 0) resp.append(buf, buf + n);
-    ::close(sock);
+    int n;
+    while ((n = ::recv(sock, buf, (int)sizeof(buf), 0)) > 0) resp.append(buf, buf + n);
+    closesock(sock);
     // strip headers
     auto pos = resp.find("\r\n\r\n");
     if (pos != std::string::npos) resp = resp.substr(pos + 4);
@@ -105,7 +133,7 @@ std::vector<prometheus::MetricFamily> MuxCollector::Collect() const {
     merged.push_back({});
     merged.back().name = name; merged.back().type = ty; return &merged.back();
   };
-  // 先收集 aggregator 自身 registry 的指标（labels.component 已由库注入，不再重复注入）
+  // 鍏堟敹闆?aggregator 鑷韩 registry 鐨勬寚鏍囷紙labels.component 宸茬敱搴撴敞鍏ワ紝涓嶅啀閲嶅娉ㄥ叆锛?
   if (auto self = self_.lock()) {
     auto self_fams = self->Collect();
     for (auto& f : self_fams) {
@@ -126,8 +154,8 @@ std::vector<prometheus::MetricFamily> MuxCollector::Collect() const {
       dst->metric.insert(dst->metric.end(), std::make_move_iterator(f.metric.begin()), std::make_move_iterator(f.metric.end()));
     }
   }
-  // 追加聚合视图（sum），仅针对 counter 与 histogram；保留 per-component 明细
-  // 按 (labels - component) 进行汇总
+  // 杩藉姞鑱氬悎瑙嗗浘锛坰um锛夛紝浠呴拡瀵?counter 涓?histogram锛涗繚鐣?per-component 鏄庣粏
+  // 鎸?(labels - component) 杩涜姹囨€?
   auto labelKeyWithoutComponent = [](const std::vector<prometheus::ClientMetric::Label>& labs) {
     std::vector<prometheus::ClientMetric::Label> v;
     v.reserve(labs.size());
@@ -149,18 +177,18 @@ std::vector<prometheus::MetricFamily> MuxCollector::Collect() const {
 
   for (const auto& f : std::as_const(merged)) {
     if (f.type == prometheus::MetricType::Histogram) {
-      // 聚合 histogram
+      // 鑱氬悎 histogram
       std::unordered_map<std::string, prometheus::ClientMetric> agg; // key -> aggregated metric
       for (const auto& m : f.metric) {
         auto key = labelKeyWithoutComponent(m.label);
         auto& dst = agg[key];
         if (dst.label.empty()) {
-          // 初始化标签（去除 component）
+          // 鍒濆鍖栨爣绛撅紙鍘婚櫎 component锛?
           for (const auto& l : m.label) if (l.name != "component") dst.label.push_back(l);
         }
         dst.histogram.sample_count += m.histogram.sample_count;
         dst.histogram.sample_sum += m.histogram.sample_sum;
-        // 按 upper_bound 汇总桶
+        // 鎸?upper_bound 姹囨€绘《
         for (const auto& b : m.histogram.bucket) {
           bool found=false;
           for (auto& db : dst.histogram.bucket) {
@@ -171,7 +199,7 @@ std::vector<prometheus::MetricFamily> MuxCollector::Collect() const {
           }
         }
       }
-      // 输出到 merged（family 同名，同类型；不移除原明细）
+      // 杈撳嚭鍒?merged锛坒amily 鍚屽悕锛屽悓绫诲瀷锛涗笉绉婚櫎鍘熸槑缁嗭級
       auto& outFam = ensureFam(f.name, f.type, f.help);
       for (auto& kv : agg) {
         auto m = std::move(kv.second);
@@ -179,7 +207,7 @@ std::vector<prometheus::MetricFamily> MuxCollector::Collect() const {
         outFam.metric.push_back(std::move(m));
       }
     } else if (f.type == prometheus::MetricType::Counter) {
-      // 聚合 counter（或按 _total 规则的 untyped）
+      // 鑱氬悎 counter锛堟垨鎸?_total 瑙勫垯鐨?untyped锛?
       std::unordered_map<std::string, prometheus::ClientMetric> agg;
       for (const auto& m : f.metric) {
         auto key = labelKeyWithoutComponent(m.label);

@@ -21,12 +21,24 @@
 #include <mutex>
 #include <string>
 #include <utility>
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 #include <vector>
 
 namespace promkit {
 
 namespace {
+
+static int GetPid() {
+#ifdef _WIN32
+  return _getpid();
+#else
+  return GetPid();
+#endif
+}
 
 struct MetricSpec {
   std::string type; // counter|gauge|histogram
@@ -119,9 +131,12 @@ static void ClearCachesLocked() {
 
 // Helper: build mux worker directory path: /tmp/promkit-mux/<ns>
 static std::string BuildMuxDir(const Config& cfg) {
-  std::string ns = cfg.prefix; // may be empty
+  std::string ns = cfg.prefix;
   if (ns.empty()) ns = "default";
-  return std::string{"/tmp/promkit-mux/"} + ns;
+  std::error_code ec;
+  auto base = std::filesystem::temp_directory_path(ec);
+  if (ec) return std::string{"/tmp/promkit-mux/"} + ns; // fallback if temp not available
+  return (base / "promkit-mux" / ns).string();
 }
 
 static bool EnsureDir(const std::string& dir) {
@@ -133,18 +148,18 @@ static bool EnsureDir(const std::string& dir) {
 
 static std::string MuxComponentName(const Config& cfg) {
   if (auto it = cfg.labels.find("component"); it != cfg.labels.end() && !it->second.empty()) return it->second;
-  return std::string{"component-"} + std::to_string(::getpid());
+  return std::string{"component-"} + std::to_string(GetPid());
 }
 
 static std::string WriteWorkerDescriptor(const Config& cfg, const std::string& dir, int port) {
   if (!EnsureDir(dir)) return {};
-  const int pid = ::getpid();
+  const int pid = GetPid();
   std::string file = dir + "/port." + std::to_string(pid);
   std::ofstream ofs(file, std::ios::trunc);
   if (!ofs) return {};
   ofs << "endpoint 127.0.0.1:" << port << "\n";
   ofs << "component " << MuxComponentName(cfg) << "\n";
-  // pid 写入仅用于调试；后续聚合不再使用 pid 作为标签
+  // pid 鍐欏叆浠呯敤浜庤皟璇曪紱鍚庣画鑱氬悎涓嶅啀浣跨敤 pid 浣滀负鏍囩
   ofs << "pid " << pid << "\n";
   ofs << "path " << (cfg.path.empty() ? "/metrics" : cfg.path) << "\n";
   ofs.close();
@@ -302,7 +317,7 @@ bool Init(const Config& cfg) noexcept {
         EnsureDir(G().mux_dir);
         G().mux_collectable = std::make_shared<promkit::mux::MuxCollector>();
         G().mux_collectable->SetDirectory(G().mux_dir);
-        // 让聚合器自身也以 component 身份加入合并
+        // 璁╄仛鍚堝櫒鑷韩涔熶互 component 韬唤鍔犲叆鍚堝苟
         G().mux_collectable->SetSelf(G().registry, MuxComponentName(cfg));
         G().exposer->RegisterCollectable(G().mux_collectable, cfg.path.empty() ? std::string{"/metrics"} : cfg.path);
         G().mux_aggregator = true;

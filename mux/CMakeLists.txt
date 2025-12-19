@@ -17,3 +17,8 @@ if(TARGET prometheus-cpp::core)
 else()
   target_link_libraries(promkit-mux PUBLIC promkit-core)
 endif()
+
+if(WIN32)
+  target_link_libraries(promkit-mux PUBLIC ws2_32)
+  target_compile_definitions(promkit-mux PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+endif()

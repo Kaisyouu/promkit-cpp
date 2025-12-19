@@ -9,13 +9,17 @@ option(PROMKIT_BUILD_EXAMPLES "Build examples" ON)
 option(PROMKIT_VENDOR_TP "Use vendored third-party under 3rd/" ON)
 option(PROMKIT_BUILD_SHARED "Build shared libraries" OFF)
 option(PROMKIT_USE_PROM_BACKEND "Enable prometheus-cpp backend when available" ON)
-
 # Language & common
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(Threads REQUIRED)
+if(MSVC)
+  # Force static runtime on MSVC (/MT for Release, /MTd for Debug) and enable EHsc
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  add_compile_options(/EHsc)
+endif()
 
 # Third-party (optional, source-only)
 # We'll only add_subdirectory if 3rd/prometheus-cpp exists.
@@ -37,6 +41,10 @@ if(PROMKIT_VENDOR_TP)
   endif()
 endif()
 
+# ensure toml++ is added even if prometheus-cpp is absent
+if(PROMKIT_VENDOR_TP AND EXISTS ${CMAKE_SOURCE_DIR}/3rd/tomlplusplus/CMakeLists.txt AND NOT TARGET tomlplusplus::tomlplusplus)
+  add_subdirectory(3rd/tomlplusplus)
+endif()
 # Subdirectories
 add_subdirectory(core)
 add_subdirectory(backends/noop)
