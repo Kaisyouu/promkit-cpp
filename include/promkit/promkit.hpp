@@ -28,6 +28,8 @@ using HistogramId = std::uint64_t;
 
 // Lifecycle
 bool Init(const Config& cfg) noexcept;
+// Init from TOML path (uses core::ParseConfigToml internally); returns false on parse or init failure.
+bool InitFromToml(const std::string& toml_path) noexcept;
 void Shutdown() noexcept;
 
 // Counters

@@ -1,0 +1,2 @@
+add_executable(example_single_minimal main_single_minimal.cpp)
+target_link_libraries(example_single_minimal PRIVATE promkit)

@@ -5,6 +5,7 @@ project(promkit-cpp VERSION 0.1.0 LANGUAGES C CXX)
 option(PROMKIT_BUILD_MUX "Build mux aggregator (single-port multiprocess)" ON)
 option(PROMKIT_ENABLE_TLS "Enable TLS for /metrics (future)" OFF)
 option(PROMKIT_BUILD_TESTS "Build tests" OFF)
+option(PROMKIT_BUILD_EXAMPLES "Build examples" ON)
 option(PROMKIT_VENDOR_TP "Use vendored third-party under 3rd/" ON)
 option(PROMKIT_BUILD_SHARED "Build shared libraries" OFF)
 option(PROMKIT_USE_PROM_BACKEND "Enable prometheus-cpp backend when available" ON)
@@ -43,6 +44,9 @@ add_subdirectory(backends/prometheus)
 if(PROMKIT_BUILD_MUX)
   add_subdirectory(mux)
 endif()
+if(PROMKIT_BUILD_EXAMPLES)
+  add_subdirectory(examples)
+endif()
 
 # Umbrella target
 add_library(promkit INTERFACE)
@@ -51,9 +55,7 @@ set(PROMKIT_PUBLIC_INCLUDE ${CMAKE_SOURCE_DIR}/include)
 
 target_include_directories(promkit INTERFACE ${PROMKIT_PUBLIC_INCLUDE})
 
-# Core is header-only for now
-add_library(promkit-core INTERFACE)
-target_include_directories(promkit-core INTERFACE ${PROMKIT_PUBLIC_INCLUDE})
+# core target is defined in core/CMakeLists; no alias needed
 
 # Backend selection (prometheus if available and enabled; otherwise noop)
 set(_PROMKIT_BACKEND "noop")

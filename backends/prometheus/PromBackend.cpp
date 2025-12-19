@@ -1,6 +1,7 @@
 // Prometheus backend: minimal single-process MVP using prometheus-cpp
 
 #include <promkit/promkit.hpp>
+#include "core/Config.hpp"
 
 #ifdef PROMKIT_BACKEND_PROM
 
@@ -68,6 +69,28 @@ bool Init(const Config& cfg) noexcept {
     G().exposer->RegisterCollectable(G().registry);
 
     return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool InitFromToml(const std::string& toml_path) noexcept {
+  // Minimal bridge: parse TOML and then call Init
+  try {
+    promkit::FileConfig fcfg;
+    std::string err;
+    if (!promkit::ParseConfigToml(toml_path, fcfg, err)) {
+      return false;
+    }
+    Config cfg;
+    cfg.enabled = fcfg.enabled;
+    cfg.mode    = fcfg.mode;
+    cfg.host    = fcfg.host;
+    cfg.port    = fcfg.port;
+    cfg.path    = fcfg.path;
+    cfg.prefix  = fcfg.ns;
+    cfg.labels  = fcfg.labels;
+    return Init(cfg);
   } catch (...) {
     return false;
   }

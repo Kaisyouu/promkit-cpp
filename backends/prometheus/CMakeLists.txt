@@ -5,10 +5,10 @@ target_sources(promkit-backend-prometheus
     PromBackend.cpp
 )
 
-target_include_directories(promkit-backend-prometheus PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(promkit-backend-prometheus PUBLIC ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/core)
 
 if(TARGET prometheus-cpp::core)
-  target_link_libraries(promkit-backend-prometheus PUBLIC prometheus-cpp::core prometheus-cpp::pull Threads::Threads)
+  target_link_libraries(promkit-backend-prometheus PUBLIC promkit-core prometheus-cpp::core prometheus-cpp::pull Threads::Threads)
   target_compile_definitions(promkit-backend-prometheus PUBLIC PROMKIT_BACKEND_PROM=1)
 else()
   message(STATUS "prometheus-cpp target not found; promkit-backend-prometheus will be a stub; building empty library")
