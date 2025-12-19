@@ -1,0 +1,2 @@
+/usr/bin/ar qc libpromkit-backend-prometheus.a CMakeFiles/promkit-backend-prometheus.dir/PromBackend.cpp.o
+/usr/bin/ranlib libpromkit-backend-prometheus.a
