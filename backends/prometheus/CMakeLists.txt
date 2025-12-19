@@ -1,0 +1,10 @@
+# Prometheus backend: link real libs if available; otherwise stub
+add_library(promkit-backend-prometheus INTERFACE)
+target_include_directories(promkit-backend-prometheus INTERFACE ${CMAKE_SOURCE_DIR}/include)
+if(TARGET prometheus-cpp::core)
+  target_link_libraries(promkit-backend-prometheus INTERFACE prometheus-cpp::core prometheus-cpp::pull)
+  target_compile_definitions(promkit-backend-prometheus INTERFACE PROMKIT_BACKEND_PROM=1)
+else()
+  message(STATUS "prometheus-cpp target not found; promkit-backend-prometheus will be a stub")
+  target_compile_definitions(promkit-backend-prometheus INTERFACE PROMKIT_BACKEND_PROM_STUB=1)
+endif()
