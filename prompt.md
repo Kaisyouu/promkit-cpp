@@ -153,6 +153,7 @@ Performance Guidance
 Vendor Layout and CMake Framework
 
 Third-party (source only; as submodules under 3rd/)
+- 3rd/tomlplusplus      # header-only TOML (toml++) for config parsing
 - 3rd/prometheus-cpp    # official repo; build with pull (CivetWeb) enabled
 - 3rd/civetweb          # optional if not bundled; prometheus-cpp can fetch it, but we vendor for determinism
 

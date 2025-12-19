@@ -1,3 +1,6 @@
 [submodule "3rd/prometheus-cpp"]
 	path = 3rd/prometheus-cpp
 	url = https://github.com/jupp0r/prometheus-cpp
+[submodule "3rd/tomlplusplus"]
+	path = 3rd/tomlplusplus
+	url = https://github.com/marzer/tomlplusplus

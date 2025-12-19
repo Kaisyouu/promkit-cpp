@@ -1,2 +1,0 @@
-/usr/bin/ar qc libpromkit-backend-noop.a CMakeFiles/promkit-backend-noop.dir/NoopBackend.cpp.o
-/usr/bin/ranlib libpromkit-backend-noop.a
