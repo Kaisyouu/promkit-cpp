@@ -1,4 +1,4 @@
-// Prometheus backend: minimal single-process MVP using prometheus-cpp
+// Prometheus backend: single-process MVP using prometheus-cpp with config-based pre-registration
 
 #include <promkit/promkit.hpp>
 #include "core/Config.hpp"
@@ -11,6 +11,7 @@
 #include <prometheus/gauge.h>
 #include <prometheus/histogram.h>
 
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -22,6 +23,15 @@ namespace promkit {
 
 namespace {
 
+struct MetricSpec {
+  std::string type; // counter|gauge|histogram
+  std::map<std::string, std::string> const_labels; // always injected for this metric
+  std::map<std::string, std::vector<std::string>> dyn; // allowed dynamic labels and values
+  std::vector<double> buckets; // for histograms when provided
+  bool has_buckets = false;
+  std::string help;
+};
+
 struct Backend {
   std::unique_ptr<prometheus::Exposer> exposer;
   std::shared_ptr<prometheus::Registry> registry;
@@ -31,6 +41,16 @@ struct Backend {
   std::map<std::string, prometheus::Family<prometheus::Counter>*> counters;
   std::map<std::string, prometheus::Family<prometheus::Gauge>*> gauges;
   std::map<std::string, prometheus::Family<prometheus::Histogram>*> histograms;
+
+  // Pre-registered time series caches by key: name|k=v,k2=v2 (sorted by key)
+  std::map<std::string, prometheus::Counter*> counter_series;
+  std::map<std::string, prometheus::Gauge*> gauge_series;
+  std::map<std::string, prometheus::Histogram*> hist_series;
+
+  // Config & metric specs (from TOML)
+  FileConfig fcfg;
+  bool has_fcfg = false;
+  std::map<std::string, MetricSpec> specs; // key: full metric name
 
   // Global config
   Config cfg;
@@ -53,6 +73,142 @@ static std::string FullName(const std::string& prefix, const std::string& name) 
   return prefix + "_" + name;
 }
 
+static std::string LabelsKey(const std::map<std::string, std::string>& labels) {
+  std::vector<std::pair<std::string,std::string>> v(labels.begin(), labels.end());
+  std::sort(v.begin(), v.end(), [](auto& a, auto& b){ return a.first < b.first; });
+  std::string key;
+  for (size_t i = 0; i < v.size(); ++i) {
+    if (i) key.push_back(',');
+    key.append(v[i].first);
+    key.push_back('=');
+    key.append(v[i].second);
+  }
+  return key;
+}
+
+static std::vector<double> DefaultLatencyBuckets() {
+  return {0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2};
+}
+
+static prometheus::Family<prometheus::Counter>& GetOrMakeCounterFam(const std::string& fname, const std::string& help) {
+  auto it = G().counters.find(fname);
+  if (it != G().counters.end()) return *it->second;
+  auto* fam = &prometheus::BuildCounter().Name(fname).Help(help).Register(*G().registry);
+  G().counters.emplace(fname, fam);
+  return *fam;
+}
+
+static prometheus::Family<prometheus::Gauge>& GetOrMakeGaugeFam(const std::string& fname, const std::string& help) {
+  auto it = G().gauges.find(fname);
+  if (it != G().gauges.end()) return *it->second;
+  auto* fam = &prometheus::BuildGauge().Name(fname).Help(help).Register(*G().registry);
+  G().gauges.emplace(fname, fam);
+  return *fam;
+}
+
+static prometheus::Family<prometheus::Histogram>& GetOrMakeHistFam(const std::string& fname, const std::string& help) {
+  auto it = G().histograms.find(fname);
+  if (it != G().histograms.end()) return *it->second;
+  auto* fam = &prometheus::BuildHistogram().Name(fname).Help(help).Register(*G().registry);
+  G().histograms.emplace(fname, fam);
+  return *fam;
+}
+
+static bool AllowedForMetric(const MetricSpec& spec, const std::map<std::string,std::string>& provided) {
+  // Allowed keys are const_labels.keys U dyn.keys; values of dyn keys must be within the list.
+  for (const auto& kv : provided) {
+    const auto& k = kv.first;
+    const auto& v = kv.second;
+    if (spec.const_labels.count(k)) {
+      if (spec.const_labels.at(k) != v) return false; // must match const label value
+      continue;
+    }
+    auto dit = spec.dyn.find(k);
+    if (dit == spec.dyn.end()) return false; // unknown key
+    const auto& allowed = dit->second;
+    if (std::find(allowed.begin(), allowed.end(), v) == allowed.end()) return false; // value not in enum
+  }
+  return true;
+}
+
+static void BuildDynCombos(const std::map<std::string, std::vector<std::string>>& dyn,
+                           std::vector<std::map<std::string,std::string>>& out,
+                           std::map<std::string,std::string> cur,
+                           std::map<std::string, std::vector<std::string>>::const_iterator it,
+                           std::map<std::string, std::vector<std::string>>::const_iterator end) {
+  if (it == end) {
+    out.emplace_back(std::move(cur));
+    return;
+  }
+  const auto& key = it->first;
+  const auto& vals = it->second;
+  auto next = it; ++next;
+  if (vals.empty()) {
+    BuildDynCombos(dyn, out, cur, next, end);
+    return;
+  }
+  for (const auto& v : vals) {
+    auto cur2 = cur;
+    cur2.emplace(key, v);
+    BuildDynCombos(dyn, out, std::move(cur2), next, end);
+  }
+}
+
+static void PreRegisterFromFileConfig() {
+  // Build MetricSpec map and pre-register all time series combinations
+  for (const auto& def : G().fcfg.metrics) {
+    const auto fname = FullName(G().cfg.prefix, def.name);
+    MetricSpec spec;
+    spec.type = def.type;
+    spec.const_labels = def.const_labels;
+    spec.dyn = def.dynamic_labels;
+    spec.help = def.help;
+    spec.has_buckets = false;
+    if (def.type == "histogram") {
+      auto itb = G().fcfg.buckets.find(def.buckets_profile);
+      if (itb != G().fcfg.buckets.end()) {
+        spec.buckets = itb->second;
+        spec.has_buckets = true;
+      }
+    }
+    G().specs.emplace(fname, spec);
+
+    // Pre-register
+    auto base = MergeLabels(G().cfg.labels, def.const_labels);
+    std::vector<std::map<std::string,std::string>> combos;
+    if (!def.dynamic_labels.empty()) {
+      BuildDynCombos(def.dynamic_labels, combos, {}, def.dynamic_labels.begin(), def.dynamic_labels.end());
+    } else {
+      combos.emplace_back(std::map<std::string,std::string>{});
+    }
+
+    std::lock_guard<std::mutex> lk(G().mu);
+    if (def.type == "counter") {
+      auto& fam = GetOrMakeCounterFam(fname, def.help);
+      for (const auto& d : combos) {
+        auto labels = MergeLabels(base, d);
+        auto& ref = fam.Add(labels);
+        G().counter_series.emplace(fname + "|" + LabelsKey(labels), &ref);
+      }
+    } else if (def.type == "gauge") {
+      auto& fam = GetOrMakeGaugeFam(fname, def.help);
+      for (const auto& d : combos) {
+        auto labels = MergeLabels(base, d);
+        auto& ref = fam.Add(labels);
+        G().gauge_series.emplace(fname + "|" + LabelsKey(labels), &ref);
+      }
+    } else if (def.type == "histogram") {
+      auto& fam = GetOrMakeHistFam(fname, def.help);
+      const auto& buckets = spec.has_buckets ? spec.buckets : DefaultLatencyBuckets();
+      for (const auto& d : combos) {
+        auto labels = MergeLabels(base, d);
+        auto& ref = fam.Add(labels, buckets);
+        G().hist_series.emplace(fname + "|" + LabelsKey(labels), &ref);
+      }
+    }
+  }
+}
+
 } // namespace
 
 bool Init(const Config& cfg) noexcept {
@@ -65,8 +221,8 @@ bool Init(const Config& cfg) noexcept {
     // Build exposer address
     std::string addr = cfg.host + ":" + std::to_string(cfg.port);
     G().exposer = std::make_unique<prometheus::Exposer>(addr);
-    // Register /metrics endpoint (default collector)
-    G().exposer->RegisterCollectable(G().registry);
+    // Register /metrics endpoint (respect configured path)
+    G().exposer->RegisterCollectable(G().registry, cfg.path.empty() ? std::string{"/metrics"} : cfg.path);
 
     return true;
   } catch (...) {
@@ -75,11 +231,11 @@ bool Init(const Config& cfg) noexcept {
 }
 
 bool InitFromToml(const std::string& toml_path) noexcept {
-  // Minimal bridge: parse TOML and then call Init
+  // Parse TOML and then call Init, then pre-register metrics
   try {
-    promkit::FileConfig fcfg;
+    FileConfig fcfg;
     std::string err;
-    if (!promkit::ParseConfigToml(toml_path, fcfg, err)) {
+    if (!ParseConfigToml(toml_path, fcfg, err)) {
       return false;
     }
     Config cfg;
@@ -90,7 +246,13 @@ bool InitFromToml(const std::string& toml_path) noexcept {
     cfg.path    = fcfg.path;
     cfg.prefix  = fcfg.ns;
     cfg.labels  = fcfg.labels;
-    return Init(cfg);
+    if (!Init(cfg)) return false;
+
+    // Save config and pre-register time series based on definitions
+    G().fcfg = std::move(fcfg);
+    G().has_fcfg = true;
+    PreRegisterFromFileConfig();
+    return true;
   } catch (...) {
     return false;
   }
@@ -109,18 +271,25 @@ CounterId CreateCounter(const std::string& name, const std::string& help,
   if (!G().cfg.enabled) return 0;
   try {
     const auto fname = FullName(G().cfg.prefix, name);
+    std::map<std::string, std::string> final_labels = MergeLabels(G().cfg.labels, const_labels);
+
     std::lock_guard<std::mutex> lk(G().mu);
-    auto it = G().counters.find(fname);
-    prometheus::Family<prometheus::Counter>* fam = nullptr;
-    if (it == G().counters.end()) {
-      fam = &prometheus::BuildCounter().Name(fname).Help(help).Register(*G().registry);
-      G().counters.emplace(fname, fam);
-    } else {
-      fam = it->second;
+    // If spec exists, enforce allowed labels and inject spec.const_labels
+    auto sit = G().specs.find(fname);
+    if (sit != G().specs.end()) {
+      for (const auto& kv : sit->second.const_labels) final_labels.emplace(kv.first, kv.second);
+      if (!AllowedForMetric(sit->second, const_labels)) return 0; // reject
+      const auto key = fname + "|" + LabelsKey(final_labels);
+      if (auto ts = G().counter_series.find(key); ts != G().counter_series.end()) {
+        return reinterpret_cast<CounterId>(ts->second);
+      }
+      // If not found, and metric was defined, do not create new dynamic series; reject
+      return 0;
     }
-    auto labels = MergeLabels(G().cfg.labels, const_labels);
-    auto& counter = fam->Add(labels);
-    return reinterpret_cast<CounterId>(&counter);
+    // No spec: create ad-hoc
+    auto& fam = GetOrMakeCounterFam(fname, help);
+    auto& ref = fam.Add(final_labels);
+    return reinterpret_cast<CounterId>(&ref);
   } catch (...) {
     return 0;
   }
@@ -137,18 +306,21 @@ GaugeId CreateGauge(const std::string& name, const std::string& help,
   if (!G().cfg.enabled) return 0;
   try {
     const auto fname = FullName(G().cfg.prefix, name);
+    std::map<std::string, std::string> final_labels = MergeLabels(G().cfg.labels, const_labels);
     std::lock_guard<std::mutex> lk(G().mu);
-    auto it = G().gauges.find(fname);
-    prometheus::Family<prometheus::Gauge>* fam = nullptr;
-    if (it == G().gauges.end()) {
-      fam = &prometheus::BuildGauge().Name(fname).Help(help).Register(*G().registry);
-      G().gauges.emplace(fname, fam);
-    } else {
-      fam = it->second;
+    auto sit = G().specs.find(fname);
+    if (sit != G().specs.end()) {
+      for (const auto& kv : sit->second.const_labels) final_labels.emplace(kv.first, kv.second);
+      if (!AllowedForMetric(sit->second, const_labels)) return 0;
+      const auto key = fname + "|" + LabelsKey(final_labels);
+      if (auto ts = G().gauge_series.find(key); ts != G().gauge_series.end()) {
+        return reinterpret_cast<GaugeId>(ts->second);
+      }
+      return 0;
     }
-    auto labels = MergeLabels(G().cfg.labels, const_labels);
-    auto& gauge = fam->Add(labels);
-    return reinterpret_cast<GaugeId>(&gauge);
+    auto& fam = GetOrMakeGaugeFam(fname, help);
+    auto& ref = fam.Add(final_labels);
+    return reinterpret_cast<GaugeId>(&ref);
   } catch (...) {
     return 0;
   }
@@ -172,18 +344,22 @@ HistogramId CreateHistogram(const std::string& name, const std::string& help,
   if (!G().cfg.enabled) return 0;
   try {
     const auto fname = FullName(G().cfg.prefix, name);
+    std::map<std::string, std::string> final_labels = MergeLabels(G().cfg.labels, const_labels);
     std::lock_guard<std::mutex> lk(G().mu);
-    auto it = G().histograms.find(fname);
-    prometheus::Family<prometheus::Histogram>* fam = nullptr;
-    if (it == G().histograms.end()) {
-      fam = &prometheus::BuildHistogram().Name(fname).Help(help).Register(*G().registry);
-      G().histograms.emplace(fname, fam);
-    } else {
-      fam = it->second;
+    auto sit = G().specs.find(fname);
+    if (sit != G().specs.end()) {
+      for (const auto& kv : sit->second.const_labels) final_labels.emplace(kv.first, kv.second);
+      if (!AllowedForMetric(sit->second, const_labels)) return 0;
+      const auto key = fname + "|" + LabelsKey(final_labels);
+      if (auto ts = G().hist_series.find(key); ts != G().hist_series.end()) {
+        return reinterpret_cast<HistogramId>(ts->second);
+      }
+      return 0;
     }
-    auto labels = MergeLabels(G().cfg.labels, const_labels);
-    auto& hist = fam->Add(labels, buckets);
-    return reinterpret_cast<HistogramId>(&hist);
+    auto& fam = GetOrMakeHistFam(fname, help);
+    const auto& used_buckets = buckets.empty() ? DefaultLatencyBuckets() : buckets;
+    auto& ref = fam.Add(final_labels, used_buckets);
+    return reinterpret_cast<HistogramId>(&ref);
   } catch (...) {
     return 0;
   }
@@ -201,6 +377,7 @@ void HistogramObserve(HistogramId id, double value) noexcept {
 
 namespace promkit {
 bool Init(const Config&) noexcept { return true; }
+bool InitFromToml(const std::string&) noexcept { return true; }
 void Shutdown() noexcept {}
 CounterId CreateCounter(const std::string&, const std::string&, const std::map<std::string, std::string>&) noexcept { return 0; }
 void CounterAdd(CounterId, double) noexcept {}
