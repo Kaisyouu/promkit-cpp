@@ -4,7 +4,7 @@ Intent
 - Provide a minimal, reusable C++23 wrapper over prometheus-cpp that standardizes metric naming, labels, buckets, and lifecycle.
 - Support two deployment modes with the same API: (1) single-process /metrics; (2) multi-process on the same host sharing one port via an in-host aggregator (“mux”).
 - Keep disabled overhead near-zero through a Noop backend and optional compile-time disable.
-- Build from source only (vendor/submodule third-parties), targeting Ubuntu (gcc/clang) and Windows (MSVC 19.50, SDK 10.0.26100.0).
+- Build from source only (3rd/ submodules), targeting Ubuntu (gcc/clang) and Windows (MSVC 19.50, SDK 10.0.26100.0).
 
 Non-Goals
 - Do not implement a generic dynamic metric system where arbitrary names/labels appear at runtime. We keep metric shape mostly static and configuration-scoped.
@@ -152,16 +152,16 @@ Performance Guidance
 
 Vendor Layout and CMake Framework
 
-Third-party (source only; as submodules under vendor/)
-- vendor/prometheus-cpp    # official repo; build with pull (CivetWeb) enabled
-- vendor/civetweb          # optional if not bundled; prometheus-cpp can fetch it, but we vendor for determinism
+Third-party (source only; as submodules under 3rd/)
+- 3rd/prometheus-cpp    # official repo; build with pull (CivetWeb) enabled
+- 3rd/civetweb          # optional if not bundled; prometheus-cpp can fetch it, but we vendor for determinism
 
 Repository Layout (refined)
 - /api        public headers (thin API, handles, RAII timer)
 - /core       registry/exposer manager, config loader, buckets
 - /backends   prometheus (glue to prometheus-cpp), noop backend
 - /mux        aggregator server, worker client, merge engine, text parser
-- /vendor     prometheus-cpp, civetweb (git submodules)
+- /3rd        prometheus-cpp, civetweb (git submodules)
 - /cmake      toolchain and helper modules
 - /examples   minimal demos (disabled by default)
 - /tests      unit tests (later)
@@ -190,8 +190,8 @@ if(PROMKIT_VENDOR_TP)
   set(ENABLE_COMPRESSION OFF CACHE BOOL "" FORCE)
   set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
   set(OVERRIDE_CIVETWEB TRUE CACHE BOOL "" FORCE)
-  add_subdirectory(vendor/prometheus-cpp)
-  # civetweb may be pulled by prometheus-cpp; vendor/civetweb is optional
+  add_subdirectory(3rd/prometheus-cpp)
+  # civetweb may be pulled by prometheus-cpp; 3rd/civetweb is optional
 endif()
 
 add_subdirectory(core)
