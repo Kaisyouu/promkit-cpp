@@ -1,4 +1,4 @@
-#include "MuxCollector.hpp"
+﻿#include "MuxCollector.hpp"
 #include "TextParser.hpp"
 
 #include <prometheus/metric_family.h>
@@ -133,7 +133,7 @@ std::vector<prometheus::MetricFamily> MuxCollector::Collect() const {
     merged.push_back({});
     merged.back().name = name; merged.back().type = ty; return &merged.back();
   };
-  // 鍏堟敹闆?aggregator 鑷韩 registry 鐨勬寚鏍囷紙labels.component 宸茬敱搴撴敞鍏ワ紝涓嶅啀閲嶅娉ㄥ叆锛?
+  // 先收集 aggregator 自身 registry 的指标（labels.component 已由库注入，不再重复注入）
   if (auto self = self_.lock()) {
     auto self_fams = self->Collect();
     for (auto& f : self_fams) {
@@ -154,8 +154,8 @@ std::vector<prometheus::MetricFamily> MuxCollector::Collect() const {
       dst->metric.insert(dst->metric.end(), std::make_move_iterator(f.metric.begin()), std::make_move_iterator(f.metric.end()));
     }
   }
-  // 杩藉姞鑱氬悎瑙嗗浘锛坰um锛夛紝浠呴拡瀵?counter 涓?histogram锛涗繚鐣?per-component 鏄庣粏
-  // 鎸?(labels - component) 杩涜姹囨€?
+      // 聚合 histogram
+  // 按 (labels - component) 进行汇总
   auto labelKeyWithoutComponent = [](const std::vector<prometheus::ClientMetric::Label>& labs) {
     std::vector<prometheus::ClientMetric::Label> v;
     v.reserve(labs.size());
@@ -177,18 +177,18 @@ std::vector<prometheus::MetricFamily> MuxCollector::Collect() const {
 
   for (const auto& f : std::as_const(merged)) {
     if (f.type == prometheus::MetricType::Histogram) {
-      // 鑱氬悎 histogram
+      // 聚合 histogram
       std::unordered_map<std::string, prometheus::ClientMetric> agg; // key -> aggregated metric
       for (const auto& m : f.metric) {
         auto key = labelKeyWithoutComponent(m.label);
         auto& dst = agg[key];
         if (dst.label.empty()) {
-          // 鍒濆鍖栨爣绛撅紙鍘婚櫎 component锛?
+          // 初始化标签（去除 component）
           for (const auto& l : m.label) if (l.name != "component") dst.label.push_back(l);
         }
         dst.histogram.sample_count += m.histogram.sample_count;
         dst.histogram.sample_sum += m.histogram.sample_sum;
-        // 鎸?upper_bound 姹囨€绘《
+        // 按 upper_bound 汇总桶
         for (const auto& b : m.histogram.bucket) {
           bool found=false;
           for (auto& db : dst.histogram.bucket) {
@@ -199,7 +199,7 @@ std::vector<prometheus::MetricFamily> MuxCollector::Collect() const {
           }
         }
       }
-      // 杈撳嚭鍒?merged锛坒amily 鍚屽悕锛屽悓绫诲瀷锛涗笉绉婚櫎鍘熸槑缁嗭級
+      // 输出到 merged（family 同名，同类型；不移除原明细）
       auto& outFam = ensureFam(f.name, f.type, f.help);
       for (auto& kv : agg) {
         auto m = std::move(kv.second);
@@ -207,7 +207,7 @@ std::vector<prometheus::MetricFamily> MuxCollector::Collect() const {
         outFam.metric.push_back(std::move(m));
       }
     } else if (f.type == prometheus::MetricType::Counter) {
-      // 鑱氬悎 counter锛堟垨鎸?_total 瑙勫垯鐨?untyped锛?
+       // 聚合 counter（或按 _total 规则的 untyped）
       std::unordered_map<std::string, prometheus::ClientMetric> agg;
       for (const auto& m : f.metric) {
         auto key = labelKeyWithoutComponent(m.label);
